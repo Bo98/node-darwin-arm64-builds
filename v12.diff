@@ -1,0 +1,554 @@
+diff --git a/deps/v8/AUTHORS b/deps/v8/AUTHORS
+index 1198de8f358fbc8449b5274ec30b78461672492c..e7dbe3e8d326b88ac6116f0eed07a2f27b329bab 100644
+--- a/deps/v8/AUTHORS
++++ b/deps/v8/AUTHORS
+@@ -57,6 +57,7 @@ Andreas Anyuru <andreas.anyuru@gmail.com>
+ Andrew Paprocki <andrew@ishiboo.com>
+ Andrei Kashcha <anvaka@gmail.com>
+ Anna Henningsen <anna@addaleax.net>
++Antoine du Hamel <duhamelantoine1995@gmail.com>
+ Anton Bikineev <ant.bikineev@gmail.com>
+ Bangfu Tao <bangfu.tao@samsung.com>
+ Daniel Shelton <d1.shelton@samsung.com>
+diff --git a/deps/v8/BUILD.gn b/deps/v8/BUILD.gn
+index 90ec4097d7a2b8bb0f4cabb70369cf3fd63656c9..9c656c7cc0a40f0160c399a8318ff5bb93bf77d4 100644
+--- a/deps/v8/BUILD.gn
++++ b/deps/v8/BUILD.gn
+@@ -2907,6 +2907,7 @@ v8_source_set("v8_base_without_compiler") {
+     "src/wasm/baseline/liftoff-compiler.cc",
+     "src/wasm/baseline/liftoff-compiler.h",
+     "src/wasm/baseline/liftoff-register.h",
++    "src/wasm/code-space-access.h",
+     "src/wasm/compilation-environment.h",
+     "src/wasm/decoder.h",
+     "src/wasm/function-body-decoder-impl.h",
+diff --git a/deps/v8/include/v8-platform.h b/deps/v8/include/v8-platform.h
+index 7e43b0d9db4a9d2b3999903572de174fa631479a..4ecdc587f58b28c7019a9ec8eb664830e59e5be7 100644
+--- a/deps/v8/include/v8-platform.h
++++ b/deps/v8/include/v8-platform.h
+@@ -240,7 +240,13 @@ class PageAllocator {
+     kReadWrite,
+     // TODO(hpayer): Remove this flag. Memory should never be rwx.
+     kReadWriteExecute,
+-    kReadExecute
++    kReadExecute,
++    // Set this when reserving memory that will later require kReadWriteExecute
++    // permissions. The resulting behavior is platform-specific, currently
++    // this is used to set the MAP_JIT flag on Apple Silicon.
++    // TODO(jkummerow): Remove this when Wasm has a platform-independent
++    // w^x implementation.
++    kNoAccessWillJitLater
+   };
+ 
+   /**
+diff --git a/deps/v8/src/base/page-allocator.cc b/deps/v8/src/base/page-allocator.cc
+index 76a0aff39953a4770ac25671f994569d0dec0ad5..eefd1d792b89bf2559e058e9dd098b614475ec75 100644
+--- a/deps/v8/src/base/page-allocator.cc
++++ b/deps/v8/src/base/page-allocator.cc
+@@ -6,6 +6,10 @@
+ 
+ #include "src/base/platform/platform.h"
+ 
++#if V8_OS_MACOSX
++#include <sys/mman.h>  // For MAP_JIT.
++#endif
++
+ namespace v8 {
+ namespace base {
+ 
+@@ -21,6 +25,8 @@ STATIC_ASSERT_ENUM(PageAllocator::kReadWriteExecute,
+                    base::OS::MemoryPermission::kReadWriteExecute);
+ STATIC_ASSERT_ENUM(PageAllocator::kReadExecute,
+                    base::OS::MemoryPermission::kReadExecute);
++STATIC_ASSERT_ENUM(PageAllocator::kNoAccessWillJitLater,
++                   base::OS::MemoryPermission::kNoAccessWillJitLater);
+ 
+ #undef STATIC_ASSERT_ENUM
+ 
+@@ -38,6 +44,14 @@ void* PageAllocator::GetRandomMmapAddr() {
+ 
+ void* PageAllocator::AllocatePages(void* hint, size_t size, size_t alignment,
+                                    PageAllocator::Permission access) {
++#if !(V8_OS_MACOSX && V8_HOST_ARCH_ARM64 && defined(MAP_JIT))
++  // kNoAccessWillJitLater is only used on Apple Silicon. Map it to regular
++  // kNoAccess on other platforms, so code doesn't have to handle both enum
++  // values.
++  if (access == PageAllocator::kNoAccessWillJitLater) {
++    access = PageAllocator::kNoAccess;
++  }
++#endif
+   return base::OS::Allocate(hint, size, alignment,
+                             static_cast<base::OS::MemoryPermission>(access));
+ }
+diff --git a/deps/v8/src/base/platform/platform-cygwin.cc b/deps/v8/src/base/platform/platform-cygwin.cc
+index 92a5fbe490f4c34db7cca19ebd47597e056194de..b9da2f1cd592db5a7b206fff531a953276e257c1 100644
+--- a/deps/v8/src/base/platform/platform-cygwin.cc
++++ b/deps/v8/src/base/platform/platform-cygwin.cc
+@@ -33,6 +33,7 @@ namespace {
+ DWORD GetProtectionFromMemoryPermission(OS::MemoryPermission access) {
+   switch (access) {
+     case OS::MemoryPermission::kNoAccess:
++    case OS::MemoryPermission::kNoAccessWillJitLater:
+       return PAGE_NOACCESS;
+     case OS::MemoryPermission::kRead:
+       return PAGE_READONLY;
+diff --git a/deps/v8/src/base/platform/platform-fuchsia.cc b/deps/v8/src/base/platform/platform-fuchsia.cc
+index fa175c39177aeac53a3eb0e1156e7812e08a8b8e..35a508a140ebd780ea44b4eae37b260989b7cdd6 100644
+--- a/deps/v8/src/base/platform/platform-fuchsia.cc
++++ b/deps/v8/src/base/platform/platform-fuchsia.cc
+@@ -18,6 +18,7 @@ namespace {
+ uint32_t GetProtectionFromMemoryPermission(OS::MemoryPermission access) {
+   switch (access) {
+     case OS::MemoryPermission::kNoAccess:
++    case OS::MemoryPermission::kNoAccessWillJitLater:
+       return 0;  // no permissions
+     case OS::MemoryPermission::kRead:
+       return ZX_VM_PERM_READ;
+diff --git a/deps/v8/src/base/platform/platform-macos.cc b/deps/v8/src/base/platform/platform-macos.cc
+index 72a41c8491ab94f91a6f33fc72b9b979806529a7..bed8b2cfc97a6e78d872c00e0685064e7e0031e5 100644
+--- a/deps/v8/src/base/platform/platform-macos.cc
++++ b/deps/v8/src/base/platform/platform-macos.cc
+@@ -49,14 +49,14 @@ std::vector<OS::SharedLibraryAddress> OS::GetSharedLibraryAddresses() {
+   for (unsigned int i = 0; i < images_count; ++i) {
+     const mach_header* header = _dyld_get_image_header(i);
+     if (header == nullptr) continue;
+-#if V8_HOST_ARCH_X64
++#if V8_HOST_ARCH_I32
++    unsigned int size;
++    char* code_ptr = getsectdatafromheader(header, SEG_TEXT, SECT_TEXT, &size);
++#else
+     uint64_t size;
+     char* code_ptr = getsectdatafromheader_64(
+         reinterpret_cast<const mach_header_64*>(header), SEG_TEXT, SECT_TEXT,
+         &size);
+-#else
+-    unsigned int size;
+-    char* code_ptr = getsectdatafromheader(header, SEG_TEXT, SECT_TEXT, &size);
+ #endif
+     if (code_ptr == nullptr) continue;
+     const intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+diff --git a/deps/v8/src/base/platform/platform-posix.cc b/deps/v8/src/base/platform/platform-posix.cc
+index c50cdd7a98eefd1911a48da4833dd208de2c21dc..501595d26367273078ae6834b621e6b55b97f21b 100644
+--- a/deps/v8/src/base/platform/platform-posix.cc
++++ b/deps/v8/src/base/platform/platform-posix.cc
+@@ -111,6 +111,7 @@ const int kMmapFdOffset = 0;
+ int GetProtectionFromMemoryPermission(OS::MemoryPermission access) {
+   switch (access) {
+     case OS::MemoryPermission::kNoAccess:
++    case OS::MemoryPermission::kNoAccessWillJitLater:
+       return PROT_NONE;
+     case OS::MemoryPermission::kRead:
+       return PROT_READ;
+@@ -134,6 +135,11 @@ int GetFlagsForMemoryPermission(OS::MemoryPermission access) {
+     flags |= MAP_LAZY;
+ #endif  // V8_OS_QNX
+   }
++#if V8_OS_MACOSX && V8_HOST_ARCH_ARM64 && defined(MAP_JIT)
++  if (access == OS::MemoryPermission::kNoAccessWillJitLater) {
++    flags |= MAP_JIT;
++  }
++#endif
+   return flags;
+ }
+ 
+@@ -333,6 +339,16 @@ bool OS::SetPermissions(void* address, size_t size, MemoryPermission access) {
+ 
+   int prot = GetProtectionFromMemoryPermission(access);
+   int ret = mprotect(address, size, prot);
++
++  // MacOS 11.2 on Apple Silicon refuses to switch permissions from
++  // rwx to none. Just use madvise instead.
++#if defined(V8_OS_MACOSX)
++  if (ret != 0 && access == OS::MemoryPermission::kNoAccess) {
++    ret = madvise(address, size, MADV_FREE_REUSABLE);
++    return ret == 0;
++  }
++#endif
++
+   if (ret == 0 && access == OS::MemoryPermission::kNoAccess) {
+     // This is advisory; ignore errors and continue execution.
+     USE(DiscardSystemPages(address, size));
+diff --git a/deps/v8/src/base/platform/platform-win32.cc b/deps/v8/src/base/platform/platform-win32.cc
+index 04ef8a30f229bd941852f681b931aae25a327144..027414e9eaee580fe2728d65aacbfdd706abdea8 100644
+--- a/deps/v8/src/base/platform/platform-win32.cc
++++ b/deps/v8/src/base/platform/platform-win32.cc
+@@ -753,6 +753,7 @@ namespace {
+ DWORD GetProtectionFromMemoryPermission(OS::MemoryPermission access) {
+   switch (access) {
+     case OS::MemoryPermission::kNoAccess:
++    case OS::MemoryPermission::kNoAccessWillJitLater:
+       return PAGE_NOACCESS;
+     case OS::MemoryPermission::kRead:
+       return PAGE_READONLY;
+diff --git a/deps/v8/src/base/platform/platform.h b/deps/v8/src/base/platform/platform.h
+index e1f84043eb8a73f1150c88e01b0075db34a7cba0..7cb22d3de4eb13b74a220b59cddc430a930be63b 100644
+--- a/deps/v8/src/base/platform/platform.h
++++ b/deps/v8/src/base/platform/platform.h
+@@ -163,7 +163,10 @@ class V8_BASE_EXPORT OS {
+     kReadWrite,
+     // TODO(hpayer): Remove this flag. Memory should never be rwx.
+     kReadWriteExecute,
+-    kReadExecute
++    kReadExecute,
++    // TODO(jkummerow): Remove this when Wasm has a platform-independent
++    // w^x implementation.
++    kNoAccessWillJitLater
+   };
+ 
+   static bool HasLazyCommits();
+diff --git a/deps/v8/src/libsampler/sampler.cc b/deps/v8/src/libsampler/sampler.cc
+index e445dfc65a708731b8eee2ad8589c9898b98d447..d3d93ba2eb7e52acd14123c57efa41b26eb5341d 100644
+--- a/deps/v8/src/libsampler/sampler.cc
++++ b/deps/v8/src/libsampler/sampler.cc
+@@ -466,7 +466,14 @@ void SignalHandler::FillRegisterState(void* context, RegisterState* state) {
+   state->pc = reinterpret_cast<void*>(mcontext->__ss.__eip);
+   state->sp = reinterpret_cast<void*>(mcontext->__ss.__esp);
+   state->fp = reinterpret_cast<void*>(mcontext->__ss.__ebp);
+-#endif  // V8_HOST_ARCH_IA32
++#elif V8_HOST_ARCH_ARM64
++  state->pc =
++      reinterpret_cast<void*>(arm_thread_state64_get_pc(mcontext->__ss));
++  state->sp =
++      reinterpret_cast<void*>(arm_thread_state64_get_sp(mcontext->__ss));
++  state->fp =
++      reinterpret_cast<void*>(arm_thread_state64_get_fp(mcontext->__ss));
++#endif  // V8_HOST_ARCH_*
+ #elif V8_OS_FREEBSD
+ #if V8_HOST_ARCH_IA32
+   state->pc = reinterpret_cast<void*>(mcontext.mc_eip);
+diff --git a/deps/v8/src/utils/allocation.cc b/deps/v8/src/utils/allocation.cc
+index f44b3c42ea9dcfcb9669c7141237a74aef5b4030..99ee20921755bc3d370b5f77acdab782decf3b26 100644
+--- a/deps/v8/src/utils/allocation.cc
++++ b/deps/v8/src/utils/allocation.cc
+@@ -207,15 +207,17 @@ bool OnCriticalMemoryPressure(size_t length) {
+ }
+ 
+ VirtualMemory::VirtualMemory(v8::PageAllocator* page_allocator, size_t size,
+-                             void* hint, size_t alignment)
++                             void* hint, size_t alignment, JitPermission jit)
+     : page_allocator_(page_allocator) {
+   DCHECK_NOT_NULL(page_allocator);
+   DCHECK(IsAligned(size, page_allocator_->CommitPageSize()));
+   size_t page_size = page_allocator_->AllocatePageSize();
+   alignment = RoundUp(alignment, page_size);
+-  Address address = reinterpret_cast<Address>(
+-      AllocatePages(page_allocator_, hint, RoundUp(size, page_size), alignment,
+-                    PageAllocator::kNoAccess));
++  PageAllocator::Permission permissions =
++      jit == kMapAsJittable ? PageAllocator::kNoAccessWillJitLater
++                            : PageAllocator::kNoAccess;
++  Address address = reinterpret_cast<Address>(AllocatePages(
++      page_allocator_, hint, RoundUp(size, page_size), alignment, permissions));
+   if (address != kNullAddress) {
+     DCHECK(IsAligned(address, alignment));
+     region_ = base::AddressRegion(address, size);
+diff --git a/deps/v8/src/utils/allocation.h b/deps/v8/src/utils/allocation.h
+index 4cb244172c5ba9a7c448356fd67e59669c9af478..fc5e6d97e7dccb60a47095c8ecdf64b64f2c2ef0 100644
+--- a/deps/v8/src/utils/allocation.h
++++ b/deps/v8/src/utils/allocation.h
+@@ -150,6 +150,8 @@ V8_EXPORT_PRIVATE bool OnCriticalMemoryPressure(size_t length);
+ // Represents and controls an area of reserved memory.
+ class V8_EXPORT_PRIVATE VirtualMemory final {
+  public:
++  enum JitPermission { kNoJit, kMapAsJittable };
++
+   // Empty VirtualMemory object, controlling no reserved memory.
+   VirtualMemory() = default;
+ 
+@@ -158,7 +160,7 @@ class V8_EXPORT_PRIVATE VirtualMemory final {
+   // size. The |size| must be aligned with |page_allocator|'s commit page size.
+   // This may not be at the position returned by address().
+   VirtualMemory(v8::PageAllocator* page_allocator, size_t size, void* hint,
+-                size_t alignment = 1);
++                size_t alignment = 1, JitPermission jit = kNoJit);
+ 
+   // Construct a virtual memory by assigning it some already mapped address
+   // and size.
+diff --git a/deps/v8/src/wasm/code-space-access.h b/deps/v8/src/wasm/code-space-access.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..5eeb980e17eddc0ed878ee1d78b7b6050126596e
+--- /dev/null
++++ b/deps/v8/src/wasm/code-space-access.h
+@@ -0,0 +1,69 @@
++// Copyright 2020 the V8 project authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef V8_WASM_CODE_SPACE_ACCESS_H_
++#define V8_WASM_CODE_SPACE_ACCESS_H_
++
++#include "src/base/build_config.h"
++#include "src/base/macros.h"
++#include "src/common/globals.h"
++
++namespace v8 {
++namespace internal {
++
++#if defined(V8_OS_MACOSX) && defined(V8_HOST_ARCH_ARM64)
++
++// Ignoring this warning is considered better than relying on
++// __builtin_available.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++inline void SwitchMemoryPermissionsToWritable() {
++  pthread_jit_write_protect_np(0);
++}
++inline void SwitchMemoryPermissionsToExecutable() {
++  pthread_jit_write_protect_np(1);
++}
++#pragma clang diagnostic pop
++
++namespace wasm {
++
++class CodeSpaceWriteScope {
++ public:
++  // TODO(jkummerow): Background threads could permanently stay in
++  // writable mode; only the main thread has to switch back and forth.
++  CodeSpaceWriteScope() {
++    if (code_space_write_nesting_level_ == 0) {
++      SwitchMemoryPermissionsToWritable();
++    }
++    code_space_write_nesting_level_++;
++  }
++  ~CodeSpaceWriteScope() {
++    code_space_write_nesting_level_--;
++    if (code_space_write_nesting_level_ == 0) {
++      SwitchMemoryPermissionsToExecutable();
++    }
++  }
++
++ private:
++  static thread_local int code_space_write_nesting_level_;
++};
++
++#define CODE_SPACE_WRITE_SCOPE CodeSpaceWriteScope _write_access_;
++
++}  // namespace wasm
++
++#else  // Not Mac-on-arm64.
++
++// Nothing to do, we map code memory with rwx permissions.
++inline void SwitchMemoryPermissionsToWritable() {}
++inline void SwitchMemoryPermissionsToExecutable() {}
++
++#define CODE_SPACE_WRITE_SCOPE
++
++#endif  // V8_OS_MACOSX && V8_HOST_ARCH_ARM64
++
++}  // namespace internal
++}  // namespace v8
++
++#endif  // V8_WASM_CODE_SPACE_ACCESS_H_
+diff --git a/deps/v8/src/wasm/wasm-code-manager.cc b/deps/v8/src/wasm/wasm-code-manager.cc
+index 91cfc01ceae6493a2b5bd6a464cb39e808a0d849..56281995a877ab4d4423df822b1cc7671459968e 100644
+--- a/deps/v8/src/wasm/wasm-code-manager.cc
++++ b/deps/v8/src/wasm/wasm-code-manager.cc
+@@ -7,6 +7,7 @@
+ #include <iomanip>
+ 
+ #include "src/base/adapters.h"
++#include "src/base/build_config.h"
+ #include "src/base/macros.h"
+ #include "src/base/platform/platform.h"
+ #include "src/base/small-vector.h"
+@@ -21,6 +22,7 @@
+ #include "src/snapshot/embedded/embedded-data.h"
+ #include "src/utils/ostreams.h"
+ #include "src/utils/vector.h"
++#include "src/wasm/code-space-access.h"
+ #include "src/wasm/compilation-environment.h"
+ #include "src/wasm/function-compiler.h"
+ #include "src/wasm/jump-table-assembler.h"
+@@ -45,6 +47,10 @@ namespace wasm {
+ 
+ using trap_handler::ProtectedInstructionData;
+ 
++#if defined(V8_OS_MACOSX) && defined(V8_HOST_ARCH_ARM64)
++thread_local int CodeSpaceWriteScope::code_space_write_nesting_level_ = 0;
++#endif
++
+ base::AddressRegion DisjointAllocationPool::Merge(base::AddressRegion region) {
+   auto dest_it = regions_.begin();
+   auto dest_end = regions_.end();
+@@ -626,6 +632,7 @@ void WasmCodeAllocator::FreeCode(Vector<WasmCode* const> codes) {
+   // Zap code area and collect freed code regions.
+   DisjointAllocationPool freed_regions;
+   size_t code_size = 0;
++  CODE_SPACE_WRITE_SCOPE
+   for (WasmCode* code : codes) {
+     ZapCode(code->instruction_start(), code->instructions().size());
+     FlushInstructionCache(code->instruction_start(),
+@@ -738,6 +745,7 @@ void NativeModule::UseLazyStub(uint32_t func_index) {
+   DCHECK_LE(module_->num_imported_functions, func_index);
+   DCHECK_LT(func_index,
+             module_->num_imported_functions + module_->num_declared_functions);
++  CODE_SPACE_WRITE_SCOPE
+ 
+   if (!lazy_compile_table_) {
+     uint32_t num_slots = module_->num_declared_functions;
+@@ -814,6 +822,7 @@ void NativeModule::SetRuntimeStubs(Isolate* isolate) {
+ WasmCode* NativeModule::AddAndPublishAnonymousCode(Handle<Code> code,
+                                                    WasmCode::Kind kind,
+                                                    const char* name) {
++  CODE_SPACE_WRITE_SCOPE
+   // For off-heap builtins, we create a copy of the off-heap instruction stream
+   // instead of the on-heap code object containing the trampoline. Ensure that
+   // we do not apply the on-heap reloc info to the off-heap instructions.
+@@ -941,6 +950,7 @@ std::unique_ptr<WasmCode> NativeModule::AddCodeWithCodeSpace(
+       static_cast<size_t>(desc.code_comments_offset);
+   const size_t instr_size = static_cast<size_t>(desc.instr_size);
+ 
++  CODE_SPACE_WRITE_SCOPE
+   memcpy(dst_code_bytes.begin(), desc.buffer,
+          static_cast<size_t>(desc.instr_size));
+ 
+@@ -1070,6 +1080,7 @@ WasmCode* NativeModule::AddDeserializedCode(
+     OwnedVector<const byte> reloc_info,
+     OwnedVector<const byte> source_position_table, WasmCode::Kind kind,
+     ExecutionTier tier) {
++  // CodeSpaceWriteScope is provided by the caller.
+   Vector<uint8_t> dst_code_bytes =
+       code_allocator_.AllocateForCode(this, instructions.size());
+   memcpy(dst_code_bytes.begin(), instructions.begin(), instructions.size());
+@@ -1126,6 +1137,7 @@ WasmCode* NativeModule::CreateEmptyJumpTableInRegion(
+   Vector<uint8_t> code_space =
+       code_allocator_.AllocateForCodeInRegion(this, jump_table_size, region);
+   DCHECK(!code_space.empty());
++  CODE_SPACE_WRITE_SCOPE
+   ZapCode(reinterpret_cast<Address>(code_space.begin()), code_space.size());
+   std::unique_ptr<WasmCode> code{new WasmCode{
+       this,                                     // native_module
+@@ -1171,6 +1183,7 @@ void NativeModule::AddCodeSpace(base::AddressRegion region) {
+ #endif  // V8_OS_WIN64
+ 
+   WasmCodeRefScope code_ref_scope;
++  CODE_SPACE_WRITE_SCOPE
+   WasmCode* jump_table = nullptr;
+   const uint32_t num_wasm_functions = module_->num_declared_functions;
+   const bool has_functions = num_wasm_functions > 0;
+@@ -1353,7 +1366,11 @@ VirtualMemory WasmCodeManager::TryAllocate(size_t size, void* hint) {
+   if (!memory_tracker_->ReserveAddressSpace(size)) return {};
+   if (hint == nullptr) hint = page_allocator->GetRandomMmapAddr();
+ 
+-  VirtualMemory mem(page_allocator, size, hint, allocate_page_size);
++  // When we start exposing Wasm in jitless mode, then the jitless flag
++  // will have to determine whether we set kMapAsJittable or not.
++  DCHECK(!FLAG_jitless);
++  VirtualMemory mem(page_allocator, size, hint, allocate_page_size,
++                    VirtualMemory::kMapAsJittable);
+   if (!mem.IsReserved()) {
+     memory_tracker_->ReleaseReservation(size);
+     return {};
+@@ -1524,6 +1541,7 @@ std::vector<WasmCode*> NativeModule::AddCompiledCode(
+   generated_code.reserve(results.size());
+ 
+   // Now copy the generated code into the code space and relocate it.
++  CODE_SPACE_WRITE_SCOPE
+   for (auto& result : results) {
+     DCHECK_EQ(result.code_desc.buffer, result.instr_buffer.get());
+     size_t code_size = RoundUp<kCodeAlignment>(result.code_desc.instr_size);
+diff --git a/deps/v8/src/wasm/wasm-serialization.cc b/deps/v8/src/wasm/wasm-serialization.cc
+index 81460b9fe29912b75fbdbf1502044cc40c18e72d..24c61e757edd046215bfff6eec67e354a00a77e6 100644
+--- a/deps/v8/src/wasm/wasm-serialization.cc
++++ b/deps/v8/src/wasm/wasm-serialization.cc
+@@ -14,6 +14,7 @@
+ #include "src/utils/ostreams.h"
+ #include "src/utils/utils.h"
+ #include "src/utils/version.h"
++#include "src/wasm/code-space-access.h"
+ #include "src/wasm/function-compiler.h"
+ #include "src/wasm/module-compiler.h"
+ #include "src/wasm/module-decoder.h"
+@@ -537,6 +538,7 @@ bool NativeModuleDeserializer::ReadCode(uint32_t fn_index, Reader* reader) {
+           protected_instructions_size);
+   reader->ReadVector(Vector<byte>::cast(protected_instructions.as_vector()));
+ 
++  CODE_SPACE_WRITE_SCOPE
+   WasmCode* code = native_module_->AddDeserializedCode(
+       fn_index, code_buffer, stack_slot_count, tagged_parameter_slots,
+       safepoint_table_offset, handler_table_offset, constant_pool_offset,
+diff --git a/tools/gyp/pylib/gyp/xcode_emulation.py b/tools/gyp/pylib/gyp/xcode_emulation.py
+index c3daba5fb82e1add1db3f21f90883e38dd8310a7..090a4330a86ba1249e5c9e9097887adcc772b3d1 100644
+--- a/tools/gyp/pylib/gyp/xcode_emulation.py
++++ b/tools/gyp/pylib/gyp/xcode_emulation.py
+@@ -625,27 +625,31 @@ class XcodeSettings(object):
+     self._WarnUnimplemented('MACH_O_TYPE')
+     self._WarnUnimplemented('PRODUCT_TYPE')
+ 
+-    if arch is not None:
+-      archs = [arch]
+-    else:
+-      assert self.configname
+-      archs = self.GetActiveArchs(self.configname)
+-    if len(archs) != 1:
+-      # TODO: Supporting fat binaries will be annoying.
+-      self._WarnUnimplemented('ARCHS')
+-      archs = ['i386']
+-    cflags.append('-arch ' + archs[0])
+-
+-    if archs[0] in ('i386', 'x86_64'):
+-      if self._Test('GCC_ENABLE_SSE3_EXTENSIONS', 'YES', default='NO'):
+-        cflags.append('-msse3')
+-      if self._Test('GCC_ENABLE_SUPPLEMENTAL_SSE3_INSTRUCTIONS', 'YES',
+-                    default='NO'):
+-        cflags.append('-mssse3')  # Note 3rd 's'.
+-      if self._Test('GCC_ENABLE_SSE41_EXTENSIONS', 'YES', default='NO'):
+-        cflags.append('-msse4.1')
+-      if self._Test('GCC_ENABLE_SSE42_EXTENSIONS', 'YES', default='NO'):
+-        cflags.append('-msse4.2')
++    # If GYP_CROSSCOMPILE (--cross-compiling), disable architecture-specific
++    # additions and assume these will be provided as required via CC_host,
++    # CXX_host, CC_target and CXX_target.
++    if not gyp.common.CrossCompileRequested():
++      if arch is not None:
++        archs = [arch]
++      else:
++        assert self.configname
++        archs = self.GetActiveArchs(self.configname)
++      if len(archs) != 1:
++        # TODO: Supporting fat binaries will be annoying.
++        self._WarnUnimplemented('ARCHS')
++        archs = ['i386']
++      cflags.append('-arch ' + archs[0])
++
++      if archs[0] in ('i386', 'x86_64'):
++        if self._Test('GCC_ENABLE_SSE3_EXTENSIONS', 'YES', default='NO'):
++          cflags.append('-msse3')
++        if self._Test('GCC_ENABLE_SUPPLEMENTAL_SSE3_INSTRUCTIONS', 'YES',
++                      default='NO'):
++          cflags.append('-mssse3')  # Note 3rd 's'.
++        if self._Test('GCC_ENABLE_SSE41_EXTENSIONS', 'YES', default='NO'):
++          cflags.append('-msse4.1')
++        if self._Test('GCC_ENABLE_SSE42_EXTENSIONS', 'YES', default='NO'):
++          cflags.append('-msse4.2')
+ 
+     cflags += self._Settings().get('WARNING_CFLAGS', [])
+ 
+@@ -888,16 +892,17 @@ class XcodeSettings(object):
+                      '-Wl,' + gyp_to_build_path(
+                                   self._Settings()['ORDER_FILE']))
+ 
+-    if arch is not None:
+-      archs = [arch]
+-    else:
+-      assert self.configname
+-      archs = self.GetActiveArchs(self.configname)
+-    if len(archs) != 1:
+-      # TODO: Supporting fat binaries will be annoying.
+-      self._WarnUnimplemented('ARCHS')
+-      archs = ['i386']
+-    ldflags.append('-arch ' + archs[0])
++    if not gyp.common.CrossCompileRequested():
++      if arch is not None:
++        archs = [arch]
++      else:
++        assert self.configname
++        archs = self.GetActiveArchs(self.configname)
++      if len(archs) != 1:
++        # TODO: Supporting fat binaries will be annoying.
++        self._WarnUnimplemented('ARCHS')
++        archs = ['i386']
++      ldflags.append('-arch ' + archs[0])
+ 
+     # Xcode adds the product directory by default.
+     # Rewrite -L. to -L./ to work around http://www.openradar.me/25313838

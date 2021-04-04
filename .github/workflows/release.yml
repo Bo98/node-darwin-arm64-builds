@@ -1,0 +1,41 @@
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: Set version
+        run: echo "VERSION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
+      - name: Build
+        run: |
+          set -x
+
+          wget https://nodejs.org/dist/$VERSION/node-$VERSION.tar.gz
+          tar xzf node-$VERSION.tar.gz
+          rm node-$VERSION.tar.gz
+          cd node-$VERSION
+
+          [ ! -f "../${VERSION%.*.*}.diff" ] || patch -p1 < "../${VERSION%.*.*}.diff"
+          touch tools/osx-codesign.sh
+
+          export SDKROOT=$(xcrun --sdk macosx --show-sdk-path)
+          export CC_host="cc -arch x86_64 -isysroot $SDKROOT"
+          export CXX_host="c++ -arch x86_64 -isysroot $SDKROOT"
+          export CC_target="cc -arch arm64 -isysroot $SDKROOT"
+          export CXX_target="c++ -arch arm64 -isysroot $SDKROOT"
+          export CC=$CC_target
+          export CXX=$CXX_target
+          make binary DESTCPU=arm64 ARCH=arm64
+
+          mv node-$VERSION-darwin-arm64.tar.gz ..
+      - name: Publish release
+        uses: marvinpinto/action-automatic-releases@latest
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          prerelease: false
+          files: |
+            node-${{ env.VERSION }}-darwin-arm64.tar.gz
